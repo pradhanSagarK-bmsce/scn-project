@@ -13,7 +13,7 @@ The official `KDDTrain+` file is used for model fitting and validation. The offi
 
 ## Four experiments
 
-The project retains the same four-experiment comparison structure. Only the conventional baseline has changed from Decision Tree to Neural Network.
+The project has four-experiment comparison structure. 
 
 | Experiment | Classifier | Original input attributes |
 |---|---|---:|
@@ -102,7 +102,7 @@ All four experiments are evaluated on the same official `KDDTest+` rows. Attack 
 
 ## Generated results
 
-Running the script regenerates the result tables and all comparison plots using the current ANFIS and NN models. Previous Decision Tree metrics should not be reused as Neural Network results.
+Running the script regenerates the result tables and all comparison plots using the current ANFIS and NN models. 
 
 ### CSV files
 
@@ -116,7 +116,7 @@ Running the script regenerates the result tables and all comparison plots using 
 - `results/fpr_comparison.png` — test-set FPR comparison across all four experiments.
 - `results/confusion_matrices.png` — four confusion matrices, one per experiment.
 
-The plots retain the same purpose and filenames as the previous project version. Their values are recalculated from the new NN experiments when the code is run.
+
 
 ## Installation
 
@@ -153,4 +153,4 @@ Run the notebook cells from top to bottom. It contains the complete implementati
 - Feature ranking is fitted on fitting data only.
 - Model selection, threshold calibration, and official test evaluation are kept separate.
 - The 3% FPR limit applies to the threshold-calibration partition, not necessarily to the final test set.
-- Model results can vary slightly across library versions and hardware. Re-run the project to obtain the current NN comparison; do not copy old Decision Tree results into the new report.
+- Model results can vary slightly across library versions and hardware.
