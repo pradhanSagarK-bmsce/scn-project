@@ -23,8 +23,8 @@ from sklearn.metrics import (
     recall_score,
 )
 from sklearn.model_selection import train_test_split
+from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.tree import DecisionTreeClassifier
 
 warnings.filterwarnings("ignore", category=UserWarning)
 SEED = 42
@@ -463,7 +463,7 @@ def anfis_predict_score(model: SugenoANFIS, X: np.ndarray, batch_size: int = 204
 
 
 def best_f1_threshold(y_true: np.ndarray, scores: np.ndarray) -> float:
-    """Pick an F1-optimal threshold on validation scores only, for both ANFIS and DT."""
+    """Pick an F1-optimal threshold on validation scores only, for both ANFIS and NN."""
     from sklearn.metrics import precision_recall_curve
     precision, recall, thresholds = precision_recall_curve(y_true, scores)
     if len(thresholds) == 0:
@@ -596,54 +596,112 @@ def tune_anfis(
     }
     return final_model, meta
 
-def tune_decision_tree(X_fit, y_fit, X_val, y_val, X_threshold, y_threshold, path_name: str, out_dir: Path):
-    """Tune tree structure on one validation set; calibrate threshold on a separate one."""
+def tune_neural_network(X_fit, y_fit, X_val, y_val, X_threshold, y_threshold, path_name: str, out_dir: Path):
+    """Tune a standard feed-forward MLP on model-selection validation; calibrate on a separate set."""
     candidates = []
-    trial_rows = []
     search_start = time.perf_counter()
-    for criterion in ("gini", "entropy"):
-        for max_depth in (None, 20, 40):
-            for min_samples_leaf in (1, 2, 5):
-                model = DecisionTreeClassifier(
-                    criterion=criterion, max_depth=max_depth,
-                    min_samples_leaf=min_samples_leaf, random_state=SEED,
-                )
-                start = time.perf_counter()
-                model.fit(X_fit, y_fit)
-                seconds = time.perf_counter() - start
-                val_scores = model.predict_proba(X_val)[:, 1]
-                model_val_threshold = threshold_for_max_recall_at_fpr(y_val, val_scores, PRIMARY_VALIDATION_FPR_CAP)
-                val_metrics = compute_metrics(y_val, (val_scores >= model_val_threshold).astype(np.int64))
-                candidates.append({
-                    "model": model, "criterion": criterion, "max_depth": max_depth,
-                    "min_samples_leaf": min_samples_leaf, "fit_seconds": seconds,
-                    "selection_threshold": model_val_threshold, "metrics": val_metrics,
-                })
-                trial_rows.append({
-                    "feature_path": path_name, "criterion": criterion,
-                    "max_depth": max_depth, "min_samples_leaf": min_samples_leaf,
-                    "fit_seconds": seconds, "model_selection_threshold": model_val_threshold,
-                    **{f"model_selection_{k}": v for k, v in val_metrics.items()},
-                })
+
+    # A compact, conventional multilayer perceptron baseline.
+    # The same preprocessed feature matrices and validation protocol are used as ANFIS.
+    configurations = [
+        ((32,), 1e-4),
+        ((32,), 1e-3),
+        ((64,), 1e-4),
+        ((64,), 1e-3),
+        ((64, 32), 1e-4),
+        ((64, 32), 1e-3),
+        ((128, 64), 1e-4),
+        ((128, 64), 1e-3),
+    ]
+
+    print(f"\\nNeural-network model-selection search for {path_name}: {len(configurations)} configurations")
+    for hidden_layers, alpha in configurations:
+        model = MLPClassifier(
+            hidden_layer_sizes=hidden_layers,
+            activation="relu",
+            solver="adam",
+            alpha=alpha,
+            batch_size=512,
+            learning_rate_init=0.001,
+            max_iter=150,
+            tol=1e-4,
+            early_stopping=True,
+            validation_fraction=0.10,
+            n_iter_no_change=12,
+            random_state=SEED,
+        )
+        start = time.perf_counter()
+        model.fit(X_fit, y_fit)
+        fit_seconds = time.perf_counter() - start
+
+        val_scores = model.predict_proba(X_val)[:, 1]
+        model_val_threshold = threshold_for_max_recall_at_fpr(
+            y_val, val_scores, PRIMARY_VALIDATION_FPR_CAP
+        )
+        val_metrics = compute_metrics(
+            y_val, (val_scores >= model_val_threshold).astype(np.int64)
+        )
+        candidates.append({
+            "model": model,
+            "hidden_layers": hidden_layers,
+            "alpha": alpha,
+            "fit_seconds": fit_seconds,
+            "iterations": int(model.n_iter_),
+            "threshold": model_val_threshold,
+            "metrics": val_metrics,
+        })
+        print(
+            f"  hidden_layers={hidden_layers}, alpha={alpha:g}: "
+            f"selection_F1={val_metrics['F1_attack']:.4f}, "
+            f"recall={val_metrics['recall_TPR']:.4f}, "
+            f"FPR={val_metrics['FPR']:.4f}, epochs={model.n_iter_}"
+        )
+
     search_seconds = time.perf_counter() - search_start
-    safe_name = path_name.lower().replace(" ", "_").replace("+", "plus")
-    # Candidate scores are used for model selection but are not exported.
     candidates.sort(key=lambda c: (
-        -c["metrics"]["F1_attack"], -c["metrics"]["recall_TPR"], c["metrics"]["FPR"]
+        -c["metrics"]["F1_attack"],
+        -c["metrics"]["recall_TPR"],
+        c["metrics"]["FPR"],
     ))
     best = candidates[0]
-    print(f"  Selected Decision Tree on model-selection families: criterion={best['criterion']}, "
-          f"max_depth={best['max_depth']}, min_samples_leaf={best['min_samples_leaf']}, "
-          f"selection F1={best['metrics']['F1_attack']:.4f}")
-    threshold_scores = best["model"].predict_proba(X_threshold)[:, 1]
+    print(
+        f"  Selected NN: hidden_layers={best['hidden_layers']}, alpha={best['alpha']:g}, "
+        f"selection F1={best['metrics']['F1_attack']:.4f}"
+    )
+
+    # Refit the selected architecture on the complete fitting partition.
+    final_model = MLPClassifier(
+        hidden_layer_sizes=best["hidden_layers"],
+        activation="relu",
+        solver="adam",
+        alpha=best["alpha"],
+        batch_size=512,
+        learning_rate_init=0.001,
+        max_iter=150,
+        tol=1e-4,
+        early_stopping=True,
+        validation_fraction=0.10,
+        n_iter_no_change=12,
+        random_state=SEED,
+    )
+    final_start = time.perf_counter()
+    final_model.fit(X_fit, y_fit)
+    final_fit_seconds = time.perf_counter() - final_start
+
+    # Threshold calibration remains separate from architecture selection.
+    threshold_scores = final_model.predict_proba(X_threshold)[:, 1]
     f1max_threshold = best_f1_threshold(y_threshold, threshold_scores)
-    f1max_metrics = compute_metrics(y_threshold, (threshold_scores >= f1max_threshold).astype(np.int64))
+    f1max_metrics = compute_metrics(
+        y_threshold, (threshold_scores >= f1max_threshold).astype(np.int64)
+    )
     threshold = threshold_for_max_recall_at_fpr(
         y_threshold, threshold_scores, PRIMARY_VALIDATION_FPR_CAP
     )
-    threshold_metrics = compute_metrics(y_threshold, (threshold_scores >= threshold).astype(np.int64))
+    threshold_metrics = compute_metrics(
+        y_threshold, (threshold_scores >= threshold).astype(np.int64)
+    )
+
     metadata = {
-        "best_n_rules": np.nan, "best_ridge_alpha": np.nan, "best_epoch": np.nan,
         "validation_threshold": threshold,
         "validation_F1_attack": threshold_metrics["F1_attack"],
         "validation_recall_TPR": threshold_metrics["recall_TPR"],
@@ -660,12 +718,14 @@ def tune_decision_tree(X_fit, y_fit, X_val, y_val, X_threshold, y_threshold, pat
         "threshold_calibration_F1max_recall": f1max_metrics["recall_TPR"],
         "threshold_calibration_F1max_FPR": f1max_metrics["FPR"],
         "learning_curve": pd.DataFrame(),
-        "training_seconds": best["fit_seconds"],
+        "training_seconds": final_fit_seconds,
         "tuning_seconds": search_seconds,
-        "tree_criterion": best["criterion"], "tree_max_depth": best["max_depth"],
-        "tree_min_samples_leaf": best["min_samples_leaf"],
+        "nn_hidden_layer_sizes": str(best["hidden_layers"]),
+        "nn_alpha": best["alpha"],
+        "nn_iterations": int(final_model.n_iter_),
     }
-    return best["model"], metadata
+    return final_model, metadata
+
 
 def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
@@ -818,8 +878,8 @@ def main():
     experiments = [
         ("1. ANFIS (41 features)", "ANFIS", "41 features"),
         ("2. Fisher + ANFIS (top 17)", "ANFIS", "Top 17 Fisher features"),
-        ("3. Decision Tree (41 features)", "DT", "41 features"),
-        ("4. Fisher + Decision Tree (top 17)", "DT", "Top 17 Fisher features"),
+        ("3. Neural Network (41 features)", "NN", "41 features"),
+        ("4. Fisher + Neural Network (top 17)", "NN", "Top 17 Fisher features"),
     ]
     rows, predictions, score_records, histories, tuning_metadata = [], {}, {}, {}, {}
     for display_name, model_type, path_name in experiments:
@@ -836,14 +896,14 @@ def main():
             classifier_name, score_type = "Feature-weighted hybrid-learning Sugeno ANFIS", "Sugeno output score"
             histories[display_name] = meta["learning_curve"]
         else:
-            model, meta = tune_decision_tree(
+            model, meta = tune_neural_network(
                 data["X_fit"], y_fit, data["X_val"], y_val,
                 data["X_threshold"], y_threshold, path_name, out_dir
             )
             score_val = model.predict_proba(data["X_val"])[:, 1]
             score_threshold = model.predict_proba(data["X_threshold"])[:, 1]
             score_test = model.predict_proba(data["X_test"])[:, 1]
-            classifier_name, score_type = "Validation-tuned Decision Tree", "Positive-class probability"
+            classifier_name, score_type = "Validation-tuned feed-forward Neural Network (MLP)", "Positive-class probability"
 
         threshold = float(meta["validation_threshold"])
         y_pred = (score_test >= threshold).astype(np.int64)
@@ -881,9 +941,9 @@ def main():
             "threshold_calibration_attack_families_held_out": ";".join(threshold_attack_types),
             "validation_attack_families_held_out": ";".join(sorted(set(selection_attack_types + threshold_attack_types))),
             "feature_relevance_std": meta.get("feature_relevance_std", np.nan),
-            "tree_criterion": meta.get("tree_criterion", ""),
-            "tree_max_depth": meta.get("tree_max_depth", ""),
-            "tree_min_samples_leaf": meta.get("tree_min_samples_leaf", ""),
+            "nn_hidden_layer_sizes": meta.get("nn_hidden_layer_sizes", ""),
+            "nn_alpha": meta.get("nn_alpha", np.nan),
+            "nn_iterations": meta.get("nn_iterations", np.nan),
             **metrics,
         }
         rows.append(row)
@@ -900,7 +960,8 @@ def main():
         if model_type == "ANFIS":
             print(f"Selected ANFIS rules={meta['best_n_rules']}, ridge={meta['best_ridge_alpha']}, best epoch={meta['best_epoch']}")
         else:
-            print(f"Selected DT: criterion={meta['tree_criterion']}, depth={meta['tree_max_depth']}, min_leaf={meta['tree_min_samples_leaf']}")
+            print(f"Selected NN: hidden_layers={meta['nn_hidden_layer_sizes']}, "
+                  f"alpha={meta['nn_alpha']}, iterations={meta['nn_iterations']}")
         print(pd.Series(metrics).to_string())
         print("\nOfficial KDDTest+ classification report:")
         print(classification_report(y_test, y_pred, target_names=["Normal (0)", "Attack (1)"], zero_division=0))
@@ -945,16 +1006,16 @@ def main():
     display_cols = [
         "experiment", "original_features", "encoded_columns", "accuracy", "precision",
         "recall_TPR", "F1_attack", "FPR", "fit_seconds", "tuning_seconds",
-        "validation_threshold", "best_n_rules", "best_ridge_alpha", "tree_criterion",
-        "tree_max_depth", "tree_min_samples_leaf",
+        "validation_threshold", "best_n_rules", "best_ridge_alpha",
+        "nn_hidden_layer_sizes", "nn_alpha", "nn_iterations",
     ]
     print(results[display_cols].to_string(index=False, float_format=lambda x: f"{x:.4f}"))
 
     plot_labels = [
         "ANFIS\n41 features",
         "Fisher + ANFIS\nTop 17",
-        "Decision Tree\n41 features",
-        "Fisher + Decision Tree\nTop 17",
+        "Neural Network\n41 features",
+        "Fisher + Neural Network\nTop 17",
     ]
 
     # Grouped comparison chart with the measured value printed above each bar.
@@ -1005,5 +1066,6 @@ def main():
     print("Figures: metric_comparison.png, fpr_comparison.png, confusion_matrices.png")
 
 
-if __name__ == "__main__":
-    main()
+
+
+main()
